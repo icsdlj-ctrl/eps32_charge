@@ -1,0 +1,24 @@
+# Local SDK, build products and scratch analysis
+/work/
+/build/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/outputs/
+__pycache__/
+*.pyc
+/.venv/
+/.idea/
+/.vscode/
+
+# Bench-only reports, copies of old documentation, device state and backups
+/*.txt
+/*.png
+**/HoloStation_last_status.json
+**/wifi_migration*
+**/wifi_nvs*
+**/COM6_original*
+**/backup*.bin
+*.log
+.env
+.env.*

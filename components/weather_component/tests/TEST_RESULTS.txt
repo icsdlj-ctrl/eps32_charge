@@ -1,0 +1,1 @@
+PASS: 115 checks; malformed responses leave prior forecast unchanged.

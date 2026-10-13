@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+set(COMPONENTS main)
+set(PROJECT_VER "1.1.6-weather.3")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(holo_weather_station)
