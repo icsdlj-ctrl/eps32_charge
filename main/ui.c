@@ -244,47 +244,66 @@ static void background(const station_snapshot_t *s, int page)
 #endif
 }
 
+static void meter(int x, int y, int w, int h, float frac, unsigned fill)
+{
+    if (w < 4 || h < 2)
+        return;
+    float radius = h * .5f;
+    rounded(x, y, w, h, radius, 0x1a2833, 15);
+    int fw = (int)(w * fmaxf(0, fminf(1, frac)) + .5f);
+    if (fw <= 0)
+        return;
+    if (fw < h)
+        fw = h;
+    if (fw > w)
+        fw = w;
+    rounded(x, y, fw, h, radius, fill, 15);
+}
 static void draw_charge(const station_snapshot_t *s, unsigned accent)
 {
     const char *names[] = {"A1", "C1", "C2", "C3"};
-    char b[48];
-    float total = 0;
-    for (int i = 0; i < 4; i++) {
-        int x = i * 71;
-        clip_right = x + 69;
-        const station_port_t *p = s->ports + i;
-        rounded(x + 2, 2, 67, 72, 5, 0x19313f, s->config.skin == 3 ? 11 : 15);
-        rounded(x + 3, 3, 65, 70, 4, 0x0b1a25, s->config.skin == 3 ? 10 : 15);
-        text(x + 7, 3, names[i], FONT_SMALL, MUTED);
-        if (p->valid) {
-            snprintf(b, sizeof(b), "%02lu:%02lu", (unsigned long)(p->seconds / 3600),
-                     (unsigned long)(p->seconds / 60 % 60));
-            text(x + 27, 3, b, FONT_SMALL, DIM);
+    char b[32];
+    float total = 0, mah = 0;
+    float limit = fmaxf(1, s->config.max_power);
+    if (s->config.skin == 3)
+        rounded(2, 2, 280, 72, 8, 0x070c14, 12);
+    for (int i = 0; i < 4; i++)
+        if (s->ports[i].valid) {
+            total += s->ports[i].power;
+            mah += s->ports[i].charge_mah;
         }
-        circle(x + 61, 9, 1.7f, p->connected ? 0x62dab3 : 0x405666);
+    snprintf(b, sizeof(b), total < 100 ? "%.1f" : "%.0f", total);
+    int end = text(8, 8, b, FONT_TEMP, WHITE);
+    text(end + 2, 22, "W", FONT_BODY, accent);
+    if (mah >= 1000)
+        snprintf(b, sizeof(b), "%.1fAh", mah / 1000);
+    else if (mah > 0)
+        snprintf(b, sizeof(b), "%.0fmAh", mah);
+    else
+        strcpy(b, "充电");
+    text(8, 46, b, FONT_SMALL, MUTED);
+    meter(8, 64, 100, 4, total / limit, accent);
+    rectangle(116, 12, 1, 52, 0x243240);
+    for (int i = 0; i < 4; i++) {
+        int x = 124 + i * 40;
+        const station_port_t *p = s->ports + i;
+        int saved = clip_right;
+        clip_right = x + 38;
+        centered(x + 16, 8, names[i], FONT_SMALL, p->valid ? MUTED : DIM);
         if (p->valid) {
             snprintf(b, sizeof(b), p->power < 100 ? "%.1f" : "%.0f", p->power);
-            int end = text(x + 7, 13, b, FONT_VALUE, WHITE);
-            text(end + 1, 23, "W", FONT_SMALL, MUTED);
-            snprintf(b, sizeof(b), "%.1fV %.2fA", p->voltage, p->current);
-            text(x + 7, 37, b, FONT_SMALL, DIM);
-            if (p->charge_mah < 99999)
-                snprintf(b, sizeof(b), "%.0fmAh", p->charge_mah);
-            else
-                snprintf(b, sizeof(b), "%.1fAh", p->charge_mah / 1000);
-            text(x + 7, 49, b, FONT_SMALL, accent);
-            snprintf(b, sizeof(b), "%.2fWh", p->energy_wh);
-            text(x + 7, 61, b, FONT_SMALL, MUTED);
-            total += p->power;
-        } else {
-            text(x + 7, 14, "--", FONT_VALUE, DIM);
-            text(x + 7, 39, "未检测到", FONT_SMALL, DIM);
-            text(x + 7, 61, "--mAh", FONT_SMALL, DIM);
-        }
+            centered(x + 16, 26, b, FONT_BODY, WHITE);
+            if (p->connected)
+                circle(x + 34, 22, 1.6f, accent);
+            meter(x + 2, 42, 32, 3, p->power / fmaxf(20, limit / 4), p->connected ? accent : DIM);
+            snprintf(b, sizeof(b), "%.1fV", p->voltage);
+            centered(x + 16, 50, b, FONT_SMALL, DIM);
+            snprintf(b, sizeof(b), "%.2fA", p->current);
+            centered(x + 16, 62, b, FONT_SMALL, DIM);
+        } else
+            centered(x + 16, 30, "--", FONT_BODY, DIM);
+        clip_right = saved;
     }
-    clip_right = LCD_WIDTH;
-    int width = (int)(LCD_WIDTH * fmaxf(0, fminf(1, total / fmaxf(1, s->config.max_power))));
-    rectangle(0, 75, width, 1, accent);
 }
 static void city_text(int x, int y, int width, const hs_weather_snapshot_t *w)
 {
@@ -317,91 +336,90 @@ static void draw_clock(const station_snapshot_t *s, const struct tm *local, bool
                        unsigned accent)
 {
     char b[80];
-    text(8, 3, "HOLO STATION", FONT_SMALL, DIM);
-    circle(145, 8, 1.6f, s->wifi_connected ? 0x62dab3 : 0x536c7f);
+    if (s->config.skin == 3)
+        rounded(2, 2, 280, 72, 8, 0x070c14, 12);
     if (valid)
         strftime(b, sizeof(b), "%H:%M", local);
     else
         strcpy(b, "--:--");
-    text(5, 14, b, FONT_CLOCK, WHITE);
+    int clock_end = text(6, 2, b, FONT_CLOCK, WHITE);
     if (valid) {
         snprintf(b, sizeof(b), "%02d", local->tm_sec);
-        text(135, 48, b, FONT_SMALL, DIM);
+        text(clock_end + 3, 28, b, FONT_BODY, DIM);
         const char *week[] = {"日", "一", "二", "三", "四", "五", "六"};
-        snprintf(b, sizeof(b), "%04d.%02d.%02d  周%s", local->tm_year + 1900, local->tm_mon + 1,
-                 local->tm_mday, week[local->tm_wday]);
+        snprintf(b, sizeof(b), "%02d.%02d  周%s", local->tm_mon + 1, local->tm_mday,
+                 week[local->tm_wday]);
     } else
-        strcpy(b, "等待网络校时");
-    text(8, 63, b, FONT_SMALL, MUTED);
-    rectangle(157, 8, 1, 59, 0x213443);
+        strcpy(b, "等待校时");
+    text(8, 58, b, FONT_SMALL, MUTED);
+    circle(142, 62, 1.7f, s->wifi_connected ? accent : 0x405666);
+    rectangle(156, 14, 1, 48, 0x243240);
     hs_weather_snapshot_t w = {0};
     hs_weather_get(&w);
-    city_text(169, 3, 73, &w);
     if (w.has_data) {
-        weather_icon(252, 1, w.forecast.weather_code, 20);
+        weather_icon(166, 8, w.forecast.weather_code, 24);
         if (w.stale || w.location_cached)
-            circle(245, 9, 1.5f, 0xf5c86b);
+            circle(188, 12, 1.5f, 0xf5c86b);
         snprintf(b, sizeof(b), "%.1f", w.forecast.temperature_c);
-        int end = text(166, 24, b, FONT_TEMP, WHITE);
-        text(end + 3, 33, "℃", FONT_BODY, accent);
-        text(169, 58, condition(w.forecast.weather_code), FONT_BODY, MUTED);
-    } else {
-        text(169, 31, s->wifi_connected ? "天气加载中" : "等待配网", FONT_BODY, DIM);
-    }
+        int end = text(198, 8, b, FONT_TEMP, WHITE);
+        text(end + 1, 22, "℃", FONT_BODY, accent);
+        city_text(198, 42, 80, &w);
+        text(198, 58, condition(w.forecast.weather_code), FONT_SMALL, MUTED);
+    } else
+        text(170, 28, s->wifi_connected ? "天气加载中" : "等待配网", FONT_BODY, DIM);
 }
 static void draw_weather(const station_snapshot_t *s, unsigned accent)
 {
-    (void)s;
     hs_weather_snapshot_t w = {0};
     char b[72];
     bool loaded = hs_weather_get(&w) == ESP_OK && w.has_data;
-    city_text(7, 2, 109, &w);
-    rectangle(123, 6, 1, 61, 0x213443);
+    if (s->config.skin == 3)
+        rounded(2, 2, 280, 72, 8, 0x070c14, 12);
+    city_text(8, 4, 104, &w);
     if (loaded) {
         snprintf(b, sizeof(b), "%.1f", w.forecast.temperature_c);
-        int end = text(5, 18, b, FONT_TEMP, WHITE);
-        text(end + 3, 27, "℃", FONT_BODY, accent);
-        text(7, 47, condition(w.forecast.weather_code), FONT_BODY, MUTED);
+        int end = text(6, 16, b, FONT_TEMP, WHITE);
+        text(end + 1, 30, "℃", FONT_BODY, accent);
+        text(8, 50, condition(w.forecast.weather_code), FONT_SMALL, MUTED);
         if (w.stale)
-            text(91, 48, "缓存", FONT_SMALL, 0xf5c86b);
+            text(72, 50, "缓存", FONT_SMALL, 0xf5c86b);
         if (w.forecast.humidity >= 0)
-            snprintf(b, sizeof(b), "RH %d%%  %.0fkm/h", w.forecast.humidity, w.forecast.wind_kmh);
+            snprintf(b, sizeof(b), "RH %d%%", w.forecast.humidity);
         else
-            snprintf(b, sizeof(b), "RH --  %.0fkm/h", w.forecast.wind_kmh);
-        text(7, 64, b, FONT_SMALL, DIM);
+            strcpy(b, "RH --");
+        text(8, 64, b, FONT_SMALL, DIM);
+        snprintf(b, sizeof(b), "%.0fkm/h", w.forecast.wind_kmh);
+        text(58, 64, b, FONT_SMALL, DIM);
     } else {
-        text(7, 20, "--", FONT_TEMP, DIM);
-        text(7, 53,
+        text(8, 18, "--", FONT_TEMP, DIM);
+        text(8, 52,
              w.status == HS_WEATHER_WAIT_CLOCK ? "等待校时"
              : w.status == HS_WEATHER_LOCATING ? "正在定位"
              : s->wifi_connected               ? "等待天气"
                                                : "请先联网",
-             FONT_BODY, DIM);
+             FONT_SMALL, DIM);
     }
     const char *days[] = {"今天", "明天", "后天"};
     for (int i = 0; i < 3; i++) {
-        int center = 151 + i * 49;
-        centered(center, 3, days[i], FONT_SMALL, i ? MUTED : accent);
+        int center = 148 + i * 46;
+        if (i)
+            rectangle(center - 24, 14, 1, 48, 0x243240);
+        centered(center, 4, days[i], FONT_SMALL, i ? MUTED : accent);
         if (loaded) {
             const hs_weather_day_t *d = &w.forecast.days[i];
-            weather_icon(center - 10, 18, d->weather_code, 18);
-            snprintf(b, sizeof(b), "%.0f/%.0f℃", d->minimum_c, d->maximum_c);
-            centered(center, 42, b, FONT_SMALL, WHITE);
-            if (d->rain_probability >= 0)
-                snprintf(b, sizeof(b), "%d%%", d->rain_probability);
-            else
-                strcpy(b, "--");
-            centered(center, 54, b, FONT_SMALL, DIM);
+            weather_icon(center - 9, 16, d->weather_code, 16);
+            snprintf(b, sizeof(b), "%.0f", d->maximum_c);
+            centered(center, 42, b, FONT_BODY, WHITE);
+            snprintf(b, sizeof(b), "%.0f", d->minimum_c);
+            centered(center, 58, b, FONT_SMALL, DIM);
         } else
             centered(center, 36, "--", FONT_SMALL, DIM);
     }
-    text(133, 66, "Open-Meteo", FONT_SMALL, DIM);
-    if (loaded)
-        text(239, 66, w.forecast.observed_at + 11, FONT_SMALL, DIM);
 }
 void station_render(uint16_t *buffer, const station_snapshot_t *s, int page, const struct tm *local,
-                    bool valid)
+                    bool valid, unsigned anim)
 {
+    (void)anim;
     frame = buffer;
     clip_right = LCD_WIDTH;
     unsigned accent = s->config.skin == 2 ? 0xf5c86b : 0x68d8ce;

@@ -7,7 +7,8 @@ extern "C" {
 #endif
 
 typedef struct {
-    uint32_t version; /* 1: manual, 2: automatic IP geolocation */
+    uint32_t version; /* 1: custom place, 2: automatic IP geolocation */
+                      /* reserved[0] = 1: custom city still needs geocoding */
     int32_t latitude_e6;
     int32_t longitude_e6;
     char city[48];

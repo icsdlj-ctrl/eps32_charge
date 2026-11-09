@@ -73,3 +73,41 @@ done:
     cJSON_Delete(root);
     return ok;
 }
+bool hs_geocode_parse(const char *body, size_t size, hs_location_t *out)
+{
+    if (!body || !out || size < 2 || size > HS_WEATHER_JSON_LIMIT || !bounded_json(body, size))
+        return false;
+    const char *end = NULL;
+    cJSON *root = cJSON_ParseWithLengthOpts(body, size, &end, false);
+    if (!root)
+        return false;
+    while (end < body + size && (*end == ' ' || *end == '\r' || *end == '\n' || *end == '\t'))
+        end++;
+    bool ok = false;
+    hs_location_t result = {0};
+    cJSON *results = cJSON_GetObjectItemCaseSensitive(root, "results");
+    cJSON *item = cJSON_IsArray(results) ? cJSON_GetArrayItem(results, 0) : NULL;
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+    const cJSON *lat = cJSON_GetObjectItemCaseSensitive(item, "latitude");
+    const cJSON *lon = cJSON_GetObjectItemCaseSensitive(item, "longitude");
+    const cJSON *zone = cJSON_GetObjectItemCaseSensitive(item, "timezone");
+    if (end != body + size || !cJSON_IsString(name) || !cJSON_IsNumber(lat) || !cJSON_IsNumber(lon) ||
+        !cJSON_IsString(zone) || !isfinite(lat->valuedouble) || !isfinite(lon->valuedouble) ||
+        lat->valuedouble < -90 || lat->valuedouble > 90 || lon->valuedouble < -180 ||
+        lon->valuedouble > 180 || !name->valuestring[0] ||
+        strlen(name->valuestring) >= sizeof(result.city) ||
+        !hs_weather_timezone_valid(zone->valuestring))
+        goto done;
+    for (const unsigned char *p = (const unsigned char *)name->valuestring; *p; p++)
+        if (*p < 32 || *p == 127)
+            goto done;
+    result.latitude_e6 = (int32_t)llround(lat->valuedouble * 1000000);
+    result.longitude_e6 = (int32_t)llround(lon->valuedouble * 1000000);
+    memcpy(result.city, name->valuestring, strlen(name->valuestring) + 1);
+    memcpy(result.timezone, zone->valuestring, strlen(zone->valuestring) + 1);
+    *out = result;
+    ok = true;
+done:
+    cJSON_Delete(root);
+    return ok;
+}

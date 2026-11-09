@@ -171,19 +171,19 @@ bool hs_weather_timezone_valid(const char *zone)
 const char *hs_weather_condition(int c)
 {
     switch(c) {
-    case 0: return "Clear";
-    case 1: return "Mainly clear";
-    case 2: return "Partly cloudy";
-    case 3: return "Cloudy";
-    case 45: case 48: return "Fog";
-    case 51: case 53: case 55: return "Drizzle";
-    case 56: case 57: return "Freezing drizzle";
-    case 61: case 63: case 65: return "Rain";
-    case 66: case 67: return "Freezing rain";
-    case 71: case 73: case 75: case 77: return "Snow";
-    case 80: case 81: case 82: return "Rain showers";
-    case 85: case 86: return "Snow showers";
-    case 95: case 96: case 99: return "Thunderstorm";
-    default: return "Unknown";
+    case 0: return "晴";
+    case 1: return "晴间多云";
+    case 2: return "多云";
+    case 3: return "阴";
+    case 45: case 48: return "雾";
+    case 51: case 53: case 55: return "毛毛雨";
+    case 56: case 57: return "冻雨";
+    case 61: case 63: case 65: return "雨";
+    case 66: case 67: return "冻雨";
+    case 71: case 73: case 75: case 77: return "雪";
+    case 80: case 81: case 82: return "阵雨";
+    case 85: case 86: return "阵雪";
+    case 95: case 96: case 99: return "雷雨";
+    default: return "未知";
     }
 }

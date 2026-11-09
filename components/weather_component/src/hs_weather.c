@@ -8,7 +8,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include "device_storage.h"
+#include <ctype.h>
 #include <inttypes.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,22 +35,106 @@ typedef struct {
     size_t limit;
 } response_t;
 
-static bool config_valid(const hs_weather_config_t *c)
+static bool text_ok(const char *s, size_t size)
 {
-    if (!c || (c->version != 1 && c->version != 2) || c->enabled > 1 || c->auto_location > 1 ||
-        !memchr(c->city, 0, sizeof(c->city)) || !memchr(c->timezone, 0, sizeof(c->timezone)))
+    if (!memchr(s, 0, size))
         return false;
-    if (!c->enabled)
-        return true;
-    if (c->version == 2 && c->auto_location && !c->city[0])
-        return true;
-    if (!c->city[0] || !hs_weather_coordinates_valid(c->latitude_e6, c->longitude_e6) ||
-        !hs_weather_timezone_valid(c->timezone))
-        return false;
-    for (const unsigned char *p = (const unsigned char *)c->city; *p; ++p)
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
         if (*p < 0x20 || *p == 0x7f)
             return false;
     return true;
+}
+static bool config_valid(const hs_weather_config_t *c)
+{
+    if (!c || (c->version != 1 && c->version != 2) || c->enabled > 1 || c->auto_location > 1 ||
+        c->reserved[0] > 1 || c->reserved[1] || !text_ok(c->city, sizeof(c->city)) ||
+        !text_ok(c->timezone, sizeof(c->timezone)))
+        return false;
+    if (!c->enabled)
+        return true;
+    if (c->timezone[0] && !hs_weather_timezone_valid(c->timezone))
+        return false;
+    if (c->auto_location)
+        return true;
+    if (!c->city[0])
+        return false;
+    if (c->reserved[0])
+        return true;
+    return hs_weather_coordinates_valid(c->latitude_e6, c->longitude_e6) &&
+           hs_weather_timezone_valid(c->timezone);
+}
+static bool load_weather_keys(nvs_handle_t handle, hs_weather_config_t *cfg)
+{
+    uint32_t schema = 0;
+    if (nvs_get_u32(handle, "schema", &schema) != ESP_OK || schema < 1)
+        return false;
+    hs_weather_config_t loaded = {0};
+    uint32_t version = 0;
+    if (nvs_get_u32(handle, "ver", &version) != ESP_OK)
+        return false;
+    loaded.version = version;
+    nvs_get_i32(handle, "lat", &loaded.latitude_e6);
+    nvs_get_i32(handle, "lon", &loaded.longitude_e6);
+    size_t n = sizeof(loaded.city);
+    nvs_get_str(handle, "city", loaded.city, &n);
+    n = sizeof(loaded.timezone);
+    nvs_get_str(handle, "tz", loaded.timezone, &n);
+    nvs_get_u8(handle, "en", &loaded.enabled);
+    nvs_get_u8(handle, "auto", &loaded.auto_location);
+    nvs_get_u8(handle, "pend", &loaded.reserved[0]);
+    if (!config_valid(&loaded))
+        return false;
+    *cfg = loaded;
+    return true;
+}
+static bool load_weather_blob(nvs_handle_t handle, hs_weather_config_t *cfg)
+{
+    size_t size = 0;
+    if (nvs_get_blob(handle, "location", NULL, &size) != ESP_OK ||
+        size < offsetof(hs_weather_config_t, enabled) + 1 || size > 512)
+        return false;
+    uint8_t raw[512];
+    if (nvs_get_blob(handle, "location", raw, &size) != ESP_OK)
+        return false;
+    hs_weather_config_t loaded = {0};
+    memcpy(&loaded, raw, size < sizeof(loaded) ? size : sizeof(loaded));
+    loaded.city[sizeof(loaded.city) - 1] = 0;
+    loaded.timezone[sizeof(loaded.timezone) - 1] = 0;
+    if (!config_valid(&loaded))
+        return false;
+    *cfg = loaded;
+    return true;
+}
+static esp_err_t save_weather_config(const hs_weather_config_t *cfg)
+{
+    nvs_handle_t handle;
+    esp_err_t err = storage_open("hs_weather", NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+        return err;
+    uint32_t schema = 1;
+    if (nvs_get_u32(handle, "schema", &schema) != ESP_OK || schema < 1)
+        schema = 1;
+    err = nvs_set_u32(handle, "schema", schema);
+    if (err == ESP_OK)
+        err = nvs_set_u32(handle, "ver", cfg->version);
+    if (err == ESP_OK)
+        err = nvs_set_i32(handle, "lat", cfg->latitude_e6);
+    if (err == ESP_OK)
+        err = nvs_set_i32(handle, "lon", cfg->longitude_e6);
+    if (err == ESP_OK)
+        err = nvs_set_str(handle, "city", cfg->city);
+    if (err == ESP_OK)
+        err = nvs_set_str(handle, "tz", cfg->timezone);
+    if (err == ESP_OK)
+        err = nvs_set_u8(handle, "en", cfg->enabled);
+    if (err == ESP_OK)
+        err = nvs_set_u8(handle, "auto", cfg->auto_location);
+    if (err == ESP_OK)
+        err = nvs_set_u8(handle, "pend", cfg->reserved[0]);
+    if (err == ESP_OK)
+        err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
 }
 
 static esp_err_t on_http(esp_http_client_event_t *event)
@@ -161,7 +248,7 @@ static esp_err_t locate(hs_weather_config_t *cfg, uint32_t revision)
     size_t size = 0;
     hs_location_t result;
     esp_err_t err =
-        fetch_body("https://ipwho.is/?fields=success,city,latitude,longitude,timezone.id&lang=en",
+        fetch_body("https://ipwho.is/?fields=success,city,latitude,longitude,timezone.id&lang=zh",
                    4096, &body, &size);
     if (err == ESP_OK && !hs_location_parse(body, size, &result))
         err = ESP_ERR_INVALID_RESPONSE;
@@ -175,27 +262,82 @@ static esp_err_t locate(hs_weather_config_t *cfg, uint32_t revision)
     memset(updated.timezone, 0, sizeof(updated.timezone));
     strcpy(updated.city, result.city);
     strcpy(updated.timezone, result.timezone);
+    updated.reserved[0] = 0;
     xSemaphoreTake(lock, portMAX_DELAY);
     if (generation != revision) {
         xSemaphoreGive(lock);
         return ESP_ERR_INVALID_STATE;
     }
     bool changed = memcmp(&state.config, &updated, sizeof(updated)) != 0;
+    if (changed)
+        err = save_weather_config(&updated);
+    /* This session can still use the verified location if cache persistence fails. */
     if (changed) {
-        nvs_handle_t h;
-        err = nvs_open("hs_weather", NVS_READWRITE, &h);
-        if (err == ESP_OK) {
-            err = nvs_set_blob(h, "location", &updated, sizeof(updated));
-            if (err == ESP_OK)
-                err = nvs_commit(h);
-            nvs_close(h);
-        }
-        /* This session can still use the verified location if cache persistence fails. */
         state.config = updated;
         state.has_data = false;
         updated_us = 0;
     }
     state.location_cached = false;
+    xSemaphoreGive(lock);
+    *cfg = updated;
+    return ESP_OK;
+}
+static bool url_encode(char *out, size_t size, const char *in)
+{
+    size_t z = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
+        bool plain = isalnum(*p) || *p == '-' || *p == '_' || *p == '.';
+        size_t need = plain ? 1 : 3;
+        if (z + need >= size)
+            return false;
+        if (plain)
+            out[z++] = (char)*p;
+        else {
+            snprintf(out + z, 4, "%%%02X", *p);
+            z += 3;
+        }
+    }
+    out[z] = 0;
+    return true;
+}
+static esp_err_t geocode(hs_weather_config_t *cfg, uint32_t revision)
+{
+    char encoded[160], url[384];
+    if (!url_encode(encoded, sizeof(encoded), cfg->city))
+        return ESP_ERR_INVALID_SIZE;
+    int len = snprintf(url, sizeof(url),
+                       "https://geocoding-api.open-meteo.com/v1/search?name=%s&count=1&language=zh"
+                       "&format=json",
+                       encoded);
+    if (len < 0 || (size_t)len >= sizeof(url))
+        return ESP_ERR_INVALID_SIZE;
+    char *body = NULL;
+    size_t size = 0;
+    hs_location_t result;
+    esp_err_t err = fetch_body(url, HS_WEATHER_JSON_LIMIT, &body, &size);
+    if (err == ESP_OK && !hs_geocode_parse(body, size, &result))
+        err = ESP_ERR_INVALID_RESPONSE;
+    free(body);
+    if (err != ESP_OK)
+        return err;
+    hs_weather_config_t updated = *cfg;
+    updated.latitude_e6 = result.latitude_e6;
+    updated.longitude_e6 = result.longitude_e6;
+    memset(updated.city, 0, sizeof(updated.city));
+    memset(updated.timezone, 0, sizeof(updated.timezone));
+    strcpy(updated.city, result.city);
+    strcpy(updated.timezone, result.timezone);
+    updated.auto_location = 0;
+    updated.reserved[0] = 0;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (generation != revision) {
+        xSemaphoreGive(lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    err = save_weather_config(&updated);
+    state.config = updated;
+    state.has_data = false;
+    updated_us = 0;
     xSemaphoreGive(lock);
     *cfg = updated;
     return ESP_OK;
@@ -257,17 +399,20 @@ static void weather_task(void *arg)
             continue;
         last_request_us = now_us;
         esp_err_t geo_error = ESP_OK;
-        if (cfg.auto_location) {
+        if (cfg.auto_location || cfg.reserved[0]) {
             set_status(HS_WEATHER_LOCATING, revision);
-            geo_error = locate(&cfg, revision);
+            geo_error = cfg.auto_location ? locate(&cfg, revision) : geocode(&cfg, revision);
             xSemaphoreTake(lock, portMAX_DELAY);
             if (generation == revision)
-                state.location_cached = geo_error != ESP_OK && cfg.city[0];
+                state.location_cached = geo_error != ESP_OK && cfg.city[0] && !cfg.reserved[0];
             xSemaphoreGive(lock);
         }
+        bool located = !cfg.reserved[0] &&
+                       hs_weather_coordinates_valid(cfg.latitude_e6, cfg.longitude_e6) &&
+                       hs_weather_timezone_valid(cfg.timezone);
         hs_weather_forecast_t forecast;
         esp_err_t err = geo_error;
-        if (geo_error == ESP_OK || cfg.city[0]) {
+        if (located) {
             set_status(HS_WEATHER_FETCHING, revision);
             err = fetch(&cfg, &forecast);
         }
@@ -309,16 +454,11 @@ esp_err_t hs_weather_start(void)
     state.config.version = 1;
     state.status = HS_WEATHER_UNCONFIGURED;
     nvs_handle_t handle;
-    esp_err_t err = nvs_open("hs_weather", NVS_READONLY, &handle);
+    esp_err_t err = storage_open("hs_weather", NVS_READONLY, &handle);
     if (err == ESP_OK) {
-        hs_weather_config_t saved = {0};
-        size_t size = sizeof(saved);
-        err = nvs_get_blob(handle, "location", &saved, &size);
+        if (!load_weather_keys(handle, &state.config))
+            load_weather_blob(handle, &state.config);
         nvs_close(handle);
-        if (err == ESP_OK && size == sizeof(saved) && config_valid(&saved))
-            state.config = saved;
-        else if (err != ESP_ERR_NVS_NOT_FOUND && err != ESP_OK)
-            goto failed;
     } else if (err != ESP_ERR_NVS_NOT_FOUND)
         goto failed;
     if (xTaskCreate(weather_task, "hs_weather", 8192, NULL, 2, &worker) != pdPASS) {
@@ -344,17 +484,11 @@ esp_err_t hs_weather_configure(const hs_weather_config_t *config)
     normalized.longitude_e6 = config->longitude_e6;
     normalized.enabled = config->enabled;
     normalized.auto_location = config->auto_location;
+    normalized.reserved[0] = config->reserved[0];
     memcpy(normalized.city, config->city, strlen(config->city) + 1);
     memcpy(normalized.timezone, config->timezone, strlen(config->timezone) + 1);
     xSemaphoreTake(lock, portMAX_DELAY);
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open("hs_weather", NVS_READWRITE, &handle);
-    if (err == ESP_OK) {
-        err = nvs_set_blob(handle, "location", &normalized, sizeof(normalized));
-        if (err == ESP_OK)
-            err = nvs_commit(handle);
-        nvs_close(handle);
-    }
+    esp_err_t err = save_weather_config(&normalized);
     if (err == ESP_OK) {
         memset(&state, 0, sizeof(state));
         state.config = normalized;

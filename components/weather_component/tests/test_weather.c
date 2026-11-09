@@ -83,9 +83,9 @@ int main(int argc,char **argv)
     CHECK(!hs_weather_timezone_valid("Asia/Shanghai&evil=1"));
     CHECK(!hs_weather_timezone_valid(""));
     CHECK(!hs_weather_timezone_valid(NULL));
-    CHECK(strcmp(hs_weather_condition(0),"Clear")==0);
-    CHECK(strcmp(hs_weather_condition(99),"Thunderstorm")==0);
-    CHECK(strcmp(hs_weather_condition(4),"Unknown")==0);
+    CHECK(strcmp(hs_weather_condition(0),"晴")==0);
+    CHECK(strcmp(hs_weather_condition(99),"雷雨")==0);
+    CHECK(strcmp(hs_weather_condition(4),"未知")==0);
     free(fixture);
     printf("PASS: %d checks; malformed responses leave prior forecast unchanged.\n",checks);
     return 0;

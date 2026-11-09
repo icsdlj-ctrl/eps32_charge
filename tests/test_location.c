@@ -20,6 +20,13 @@ int main(void){
     for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++){CHECK(!parse(bad[i],&out));CHECK(!memcmp(&out,&sentinel,sizeof(out)));}
     CHECK(parse("{\"success\":true,\"city\":\"London\",\"latitude\":0,\"longitude\":0,\"timezone\":{\"id\":\"Europe/London\"}}",&out));
     CHECK(out.latitude_e6==0&&out.longitude_e6==0);CHECK(!strcmp(out.city,"London"));
+    CHECK(parse("{\"success\":true,\"city\":\"珠海\",\"latitude\":22.27694,\"longitude\":113.56778,\"timezone\":{\"id\":\"Asia/Shanghai\"}}",&out));
+    CHECK(!strcmp(out.city,"珠海"));CHECK(out.latitude_e6==22276940);CHECK(!strcmp(out.timezone,"Asia/Shanghai"));
+    const char *geo="{\"results\":[{\"name\":\"珠海\",\"latitude\":22.27694,\"longitude\":113.56778,\"timezone\":\"Asia/Shanghai\"}]}";
+    CHECK(hs_geocode_parse(geo,strlen(geo),&out));CHECK(!strcmp(out.city,"珠海"));CHECK(!strcmp(out.timezone,"Asia/Shanghai"));
+    const char *empty_geo="{\"results\":[]}";
+    CHECK(!hs_geocode_parse(empty_geo,strlen(empty_geo),&out));
+    CHECK(!hs_geocode_parse("{}",2,&out));
     char deep[128];memset(deep,'[',20);memset(deep+20,']',20);CHECK(!hs_location_parse(deep,40,&out));
     CHECK(!hs_location_parse(ok,5000,&out));CHECK(!hs_location_parse(NULL,0,&out));
     printf("IP location parser: %u checks passed.\n",checks);return 0;

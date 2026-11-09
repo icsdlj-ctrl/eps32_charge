@@ -1,9 +1,11 @@
 #include "station.h"
+#include "device_storage.h"
 #include "hs_weather.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include "mbedtls/base64.h"
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -48,8 +50,42 @@ void station_network_state(bool connected, const char *ip)
 {
     xSemaphoreTake(state_lock, portMAX_DELAY);
     state.wifi_connected = connected;
+    if (connected)
+        state.wifi_reason = 0;
     snprintf(state.ip, sizeof(state.ip), "%s", ip ? ip : "");
     xSemaphoreGive(state_lock);
+}
+void station_wifi_diag(const char *ssid, int reason)
+{
+    xSemaphoreTake(state_lock, portMAX_DELAY);
+    if (ssid)
+        snprintf(state.wifi_ssid, sizeof(state.wifi_ssid), "%s", ssid);
+    state.wifi_reason = reason;
+    xSemaphoreGive(state_lock);
+}
+const char *station_wifi_fail(int reason)
+{
+    switch (reason) {
+    case 0:
+        return "";
+    case 15:
+    case 202:
+    case 204:
+        return "密码错误或路由器拒绝了连接";
+    case 201:
+        return "找不到这个 Wi-Fi，请确认是 2.4 GHz 且名称正确";
+    case 203:
+        return "已找到热点，但关联失败";
+    case 200:
+        return "信号中断，路由器无响应";
+    case 2:
+    case 23:
+        return "认证失败，请核对密码和加密方式";
+    case 8:
+        return "路由器主动断开了连接";
+    default:
+        return "联网失败";
+    }
 }
 void station_status(const char *text)
 {
@@ -79,7 +115,7 @@ static bool hhmm(int n)
 esp_err_t station_load_settings(void)
 {
     nvs_handle_t h;
-    esp_err_t e = nvs_open("devConfig", NVS_READONLY, &h);
+    esp_err_t e = storage_open("devConfig", NVS_READONLY, &h);
     if (e == ESP_ERR_NVS_NOT_FOUND)
         return ESP_OK;
     if (e != ESP_OK)
@@ -119,7 +155,7 @@ esp_err_t station_load_settings(void)
 static esp_err_t save_config(const station_config_t *c)
 {
     nvs_handle_t h;
-    esp_err_t e = nvs_open("devConfig", NVS_READWRITE, &h);
+    esp_err_t e = storage_open("devConfig", NVS_READWRITE, &h);
     if (e != ESP_OK)
         return e;
     const uint8_t small[] = {c->brightness, c->night_brightness, c->night_enabled, c->skin};
@@ -251,6 +287,75 @@ static esp_err_t apply_json(const char *text, size_t length)
         if (err != ESP_OK)
             goto done;
     }
+    o = cJSON_GetObjectItemCaseSensitive(root, "scanWiFi");
+    if (o) {
+        handled = true;
+        err = station_scan_wifi();
+        if (err != ESP_OK)
+            goto done;
+    }
+    o = cJSON_GetObjectItemCaseSensitive(root, "scanBle");
+    if (o) {
+        handled = true;
+        err = station_scan_ble();
+        if (err != ESP_OK)
+            goto done;
+    }
+    o = cJSON_GetObjectItemCaseSensitive(root, "setLocation");
+    if (o) {
+        handled = true;
+        const cJSON *mode = cJSON_GetObjectItemCaseSensitive(o, "mode");
+        hs_weather_snapshot_t weather;
+        if (!cJSON_IsString(mode) || hs_weather_get(&weather) != ESP_OK) {
+            err = ESP_ERR_INVALID_ARG;
+            goto done;
+        }
+        hs_weather_config_t cfg = weather.config;
+        cfg.enabled = 1;
+        cfg.reserved[0] = 0;
+        cfg.reserved[1] = 0;
+        if (!strcmp(mode->valuestring, "auto")) {
+            cfg.version = 2;
+            cfg.auto_location = 1;
+        } else if (!strcmp(mode->valuestring, "custom")) {
+            const cJSON *city = cJSON_GetObjectItemCaseSensitive(o, "city");
+            const cJSON *lat = cJSON_GetObjectItemCaseSensitive(o, "latitude");
+            const cJSON *lon = cJSON_GetObjectItemCaseSensitive(o, "longitude");
+            const cJSON *zone = cJSON_GetObjectItemCaseSensitive(o, "timezone");
+            if (!cJSON_IsString(city) || !city->valuestring[0] ||
+                strlen(city->valuestring) >= sizeof(cfg.city)) {
+                err = ESP_ERR_INVALID_ARG;
+                goto done;
+            }
+            cfg.version = 1;
+            cfg.auto_location = 0;
+            memset(cfg.city, 0, sizeof(cfg.city));
+            memcpy(cfg.city, city->valuestring, strlen(city->valuestring) + 1);
+            if (cJSON_IsNumber(lat) || cJSON_IsNumber(lon) || cJSON_IsString(zone)) {
+                if (!cJSON_IsNumber(lat) || !cJSON_IsNumber(lon) || !cJSON_IsString(zone) ||
+                    !isfinite(lat->valuedouble) || !isfinite(lon->valuedouble) ||
+                    !hs_weather_timezone_valid(zone->valuestring)) {
+                    err = ESP_ERR_INVALID_ARG;
+                    goto done;
+                }
+                cfg.latitude_e6 = (int32_t)llround(lat->valuedouble * 1000000.0);
+                cfg.longitude_e6 = (int32_t)llround(lon->valuedouble * 1000000.0);
+                memset(cfg.timezone, 0, sizeof(cfg.timezone));
+                memcpy(cfg.timezone, zone->valuestring, strlen(zone->valuestring) + 1);
+            } else {
+                cfg.latitude_e6 = 0;
+                cfg.longitude_e6 = 0;
+                memset(cfg.timezone, 0, sizeof(cfg.timezone));
+                cfg.reserved[0] = 1;
+            }
+        } else {
+            err = ESP_ERR_INVALID_ARG;
+            goto done;
+        }
+        err = hs_weather_configure(&cfg);
+        if (err != ESP_OK)
+            goto done;
+    }
     o = cJSON_GetObjectItemCaseSensitive(root, "setImage");
     if (o) {
         handled = true;
@@ -284,6 +389,65 @@ static esp_err_t apply_json(const char *text, size_t length)
     if (o) {
         handled = true; /* New firmware has no vendor activation requirement. */
     }
+    o = cJSON_GetObjectItemCaseSensitive(root, "present");
+    if (o) {
+        handled = true;
+        const cJSON *clear = cJSON_GetObjectItemCaseSensitive(o, "clear");
+        if (cJSON_IsTrue(clear)) {
+            station_present_clear();
+        } else {
+            int offset = 0;
+            const cJSON *data = cJSON_GetObjectItemCaseSensitive(o, "data");
+            const cJSON *flush = cJSON_GetObjectItemCaseSensitive(o, "flush");
+            if (!cJSON_IsString(data) || !get_int(o, "offset", 0, LCD_WIDTH * LCD_HEIGHT * 2, &offset)) {
+                err = ESP_ERR_INVALID_ARG;
+                goto done;
+            }
+            unsigned char raw[768];
+            size_t n = 0;
+            int rc = mbedtls_base64_decode(raw, sizeof(raw), &n, (const unsigned char *)data->valuestring,
+                                           strlen(data->valuestring));
+            if (rc != 0 || (n & 1)) {
+                err = ESP_ERR_INVALID_SIZE;
+                goto done;
+            }
+            err = station_present_write((size_t)offset, raw, n, cJSON_IsTrue(flush));
+        }
+    }
+    o = cJSON_GetObjectItemCaseSensitive(root, "setAlert");
+    if (o) {
+        handled = true;
+        const cJSON *mode = cJSON_GetObjectItemCaseSensitive(o, "mode");
+        const cJSON *source = cJSON_GetObjectItemCaseSensitive(o, "source");
+        uint8_t alert = 0;
+        if (!cJSON_IsString(mode)) {
+            err = ESP_ERR_INVALID_ARG;
+            goto done;
+        }
+        if (!strcmp(mode->valuestring, "confirm"))
+            alert = 1;
+        else if (!strcmp(mode->valuestring, "done"))
+            alert = 2;
+        else if (strcmp(mode->valuestring, "off")) {
+            err = ESP_ERR_INVALID_ARG;
+            goto done;
+        }
+        char src[12] = "CURSOR";
+        if (cJSON_IsString(source) && source->valuestring[0])
+            snprintf(src, sizeof(src), "%.11s", source->valuestring);
+        for (char *p = src; *p; ++p)
+            *p = (char)toupper((unsigned char)*p);
+        xSemaphoreTake(state_lock, portMAX_DELAY);
+        state.alert_mode = alert;
+        snprintf(state.alert_source, sizeof(state.alert_source), "%s", src);
+        xSemaphoreGive(state_lock);
+    }
+    o = cJSON_GetObjectItemCaseSensitive(root, "stopApp");
+    if (o)
+        station_set_held(true);
+    o = cJSON_GetObjectItemCaseSensitive(root, "runApp");
+    if (o)
+        station_set_held(false);
     if (!handled)
         err = ESP_ERR_NOT_SUPPORTED;
 done:

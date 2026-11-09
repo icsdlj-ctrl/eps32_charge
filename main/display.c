@@ -46,6 +46,48 @@ static bool IRAM_ATTR on_transfer(esp_lcd_panel_io_handle_t io,
     xSemaphoreGiveFromISR((SemaphoreHandle_t)arg, &wake);
     return wake == pdTRUE;
 }
+static volatile bool presenting;
+
+bool station_present_active(void)
+{
+    return presenting;
+}
+void station_present_clear(void)
+{
+    presenting = false;
+}
+static esp_err_t present_locked(size_t offset, const uint8_t *data, size_t length, bool flush)
+{
+    const size_t total = (size_t)LCD_WIDTH * LCD_HEIGHT * 2;
+    if (!frame || !panel || (offset & 1) || (length & 1) || offset + length > total)
+        return ESP_ERR_INVALID_ARG;
+    presenting = true;
+    if (data && length) {
+        uint8_t *dst = (uint8_t *)frame + offset;
+        for (size_t i = 0; i < length; i += 2) {
+            dst[i] = data[i + 1];
+            dst[i + 1] = data[i];
+        }
+    }
+    if (!flush)
+        return ESP_OK;
+    esp_err_t err = esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_WIDTH, LCD_HEIGHT, frame);
+    if (err == ESP_OK && xSemaphoreTake(transfer_done, pdMS_TO_TICKS(1000)) != pdTRUE)
+        err = ESP_ERR_TIMEOUT;
+    return err;
+}
+esp_err_t station_present_write(size_t offset, const uint8_t *data, size_t length, bool flush)
+{
+    if (!drawing || xSemaphoreTake(drawing, pdMS_TO_TICKS(800)) != pdTRUE)
+        return ESP_ERR_TIMEOUT;
+    esp_err_t err = present_locked(offset, data, length, flush);
+    xSemaphoreGive(drawing);
+    return err;
+}
+esp_err_t station_present_flush(void)
+{
+    return station_present_write(0, NULL, 0, true);
+}
 static void display_task(void *arg)
 {
     (void)arg;
@@ -82,8 +124,17 @@ static void display_task(void *arg)
         }
         if (esp_timer_get_time() < boot_end)
             page = PAGE_BOOT;
+        if (presenting) {
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
         xSemaphoreTake(drawing, portMAX_DELAY);
-        station_render(frame, &s, page, &local, valid);
+        if (presenting) {
+            xSemaphoreGive(drawing);
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
+        }
+        station_render(frame, &s, page, &local, valid, ticks);
         esp_err_t e = esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_WIDTH, LCD_HEIGHT, frame);
         if (e == ESP_OK)
             xSemaphoreTake(transfer_done, portMAX_DELAY);
@@ -94,7 +145,7 @@ static void display_task(void *arg)
             ESP_LOGI("STATION", "page=%d wifi=%d INA=%d%d%d%d free=%lu", page, s.wifi_connected,
                      s.ports[0].valid, s.ports[1].valid, s.ports[2].valid, s.ports[3].valid,
                      (unsigned long)esp_get_free_heap_size());
-        vTaskDelay(pdMS_TO_TICKS(400));
+        vTaskDelay(pdMS_TO_TICKS(s.alert_mode ? 70 : 400));
     }
 }
 esp_err_t station_start_display(void)

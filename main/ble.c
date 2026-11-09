@@ -10,9 +10,17 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "host/ble_hs_adv.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdio.h>
+
+#define BLE_SEEN 12
+static station_ble_device_t seen[BLE_SEEN];
+static int seen_count;
+static SemaphoreHandle_t ble_lock;
+static SemaphoreHandle_t ble_scan_done;
+static bool ble_scanning;
 
 static const ble_uuid16_t service_uuid = BLE_UUID16_INIT(0x180a);
 static const ble_uuid16_t tx_uuid = BLE_UUID16_INIT(0x2a29);
@@ -87,7 +95,52 @@ static int on_gap(struct ble_gap_event *event, void *arg)
         if (event->subscribe.attr_handle == tx_handle)
             subscribed = event->subscribe.cur_notify;
         break;
-    default:
+    case BLE_GAP_EVENT_DISC: {
+        station_ble_device_t item = {0};
+        const uint8_t *raw = event->disc.addr.val;
+        snprintf(item.addr, sizeof(item.addr), "%02X:%02X:%02X:%02X:%02X:%02X", raw[5], raw[4], raw[3],
+                 raw[2], raw[1], raw[0]);
+        struct ble_hs_adv_fields fields;
+        if (!ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) &&
+            fields.name && fields.name_len) {
+            size_t n = fields.name_len < sizeof(item.name) - 1 ? fields.name_len : sizeof(item.name) - 1;
+            memcpy(item.name, fields.name, n);
+        } else
+            memcpy(item.name, item.addr, sizeof(item.addr));
+        item.rssi = event->disc.rssi;
+        if (ble_lock && xSemaphoreTake(ble_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+            int at = -1;
+            for (int i = 0; i < seen_count; i++) {
+                if (!strcmp(seen[i].addr, item.addr)) {
+                    at = i;
+                    break;
+                }
+            }
+            if (at >= 0) {
+                if (item.rssi > seen[at].rssi)
+                    seen[at].rssi = item.rssi;
+                if (strcmp(item.name, item.addr) != 0)
+                    memcpy(seen[at].name, item.name, sizeof(item.name));
+            } else if (seen_count < BLE_SEEN) {
+                seen[seen_count++] = item;
+            } else {
+                int weak = 0;
+                for (int i = 1; i < seen_count; i++) {
+                    if (seen[i].rssi < seen[weak].rssi)
+                        weak = i;
+                }
+                if (item.rssi > seen[weak].rssi)
+                    seen[weak] = item;
+            }
+            xSemaphoreGive(ble_lock);
+        }
+        break;
+    }
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+        ble_scanning = false;
+        if (ble_scan_done)
+            xSemaphoreGive(ble_scan_done);
+        advertise();
         break;
     }
     return 0;
@@ -168,7 +221,9 @@ static void notify_task(void *arg)
 esp_err_t station_start_ble(void)
 {
     commands = xQueueCreate(4, sizeof(ble_command_t));
-    if (!commands)
+    ble_lock = xSemaphoreCreateMutex();
+    ble_scan_done = xSemaphoreCreateBinary();
+    if (!commands || !ble_lock || !ble_scan_done)
         return ESP_ERR_NO_MEM;
     esp_err_t e = nimble_port_init();
     if (e != ESP_OK)
@@ -188,4 +243,68 @@ esp_err_t station_start_ble(void)
         return ESP_ERR_NO_MEM;
     nimble_port_freertos_init(host_task);
     return ESP_OK;
+}
+static int signal_percent(int rssi)
+{
+    if (rssi >= -50)
+        return 100;
+    if (rssi <= -100)
+        return 0;
+    return (rssi + 100) * 2;
+}
+esp_err_t station_scan_ble(void)
+{
+    if (!ble_scan_done)
+        return ESP_ERR_INVALID_STATE;
+    if (ble_scanning)
+        return ESP_ERR_INVALID_STATE;
+    if (ble_gap_adv_active())
+        ble_gap_adv_stop();
+    if (xSemaphoreTake(ble_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+        seen_count = 0;
+        xSemaphoreGive(ble_lock);
+    }
+    xSemaphoreTake(ble_scan_done, 0);
+    struct ble_gap_disc_params params = {.passive = 0, .filter_duplicates = 0};
+    ble_scanning = true;
+    int rc = ble_gap_disc(address_type, 2500, &params, on_gap, NULL);
+    if (rc) {
+        ble_scanning = false;
+        advertise();
+        return ESP_FAIL;
+    }
+    if (xSemaphoreTake(ble_scan_done, pdMS_TO_TICKS(4000)) != pdTRUE) {
+        ble_gap_disc_cancel();
+        ble_scanning = false;
+        advertise();
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+int station_ble_copy(station_ble_device_t *out, int max)
+{
+    if (!out || max < 1 || !ble_lock)
+        return 0;
+    if (xSemaphoreTake(ble_lock, pdMS_TO_TICKS(200)) != pdTRUE)
+        return 0;
+    int n = seen_count < max ? seen_count : max;
+    for (int i = 0; i < n; i++) {
+        int best = i;
+        for (int j = i + 1; j < seen_count; j++) {
+            if (seen[j].rssi > seen[best].rssi)
+                best = j;
+        }
+        if (best != i) {
+            station_ble_device_t swap = seen[i];
+            seen[i] = seen[best];
+            seen[best] = swap;
+        }
+        out[i] = seen[i];
+    }
+    xSemaphoreGive(ble_lock);
+    return n;
+}
+int station_signal_percent(int rssi)
+{
+    return signal_percent(rssi);
 }

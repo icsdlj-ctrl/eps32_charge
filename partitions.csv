@@ -1,7 +1,12 @@
 # Name, Type, SubType, Offset, Size, Flags
+# nvs keeps IDF calibration data. Do not move it; older settings are copied out once.
 nvs,data,nvs,0x9000,0x5000,
 otadata,data,ota,0xe000,0x2000,
 app0,app,ota_0,0x10000,0x1c0000,
 app1,app,ota_1,0x1d0000,0x1c0000,
+# Custom pictures. Offset stays fixed so uploads survive app updates.
 spiffs,data,spiffs,0x390000,0x5000,
 coredump,data,coredump,0x395000,0x5000,
+# Wi-Fi, display settings and weather. Never move this offset. Grow only into
+# the unused flash after 0x3aa000, and add new values as new NVS keys.
+storage,data,nvs,0x39a000,0x10000,
