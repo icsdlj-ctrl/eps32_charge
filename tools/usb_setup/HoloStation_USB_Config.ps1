@@ -2,10 +2,13 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+. (Join-Path $PSScriptRoot 'Wifi_Status.ps1')
 $script:port = $null
 $script:buffer = ''
 $script:lastQuery = [DateTime]::MinValue
 $script:deviceIP = ''
+$script:pendingWifi = $null
+$script:lastStatus = $null
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'HoloStation USB 配网与天气设置'
 $form.Size = New-Object System.Drawing.Size(720,620)
@@ -63,12 +66,38 @@ function Send-Command($command) {
 function Do-Action($action) {
     try{& $action}catch{$message.Text=$_.Exception.Message;$message.ForeColor=[System.Drawing.Color]::Firebrick}
 }
+function Set-WifiMessage($text, [bool]$failed) {
+    $message.Text=$text
+    $message.ForeColor=if($failed){[System.Drawing.Color]::Firebrick}else{[System.Drawing.Color]::DarkGreen}
+}
+function Finish-WifiSetup($outcome) {
+    $script:pendingWifi=$null
+    $save.Enabled=$true
+    $ssid.Enabled=$true
+    $password.Enabled=$true
+    if($outcome.State -ne 'Failed'){$password.Clear()}
+    Set-WifiMessage $outcome.Detail ($outcome.State -eq 'Failed')
+}
 function Apply-Status($d) {
-    try { [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'HoloStation_last_status.json'),(ConvertTo-Json $d -Depth 10), (New-Object System.Text.UTF8Encoding($false))) } catch {}
-    if($d.error){$message.Text='设备返回：'+$d.error;return}
-    $script:deviceIP=[string]$d.ip
-    if($d.config.wifiState -eq 2){$connection.Text='USB 已连接 | Wi-Fi 已联网 | 地址：'+$d.ip}
-    else{$connection.Text='USB 已连接 | Wi-Fi 尚未联网（检查名称、密码和 2.4 GHz 信号）'}
+    if($script:pendingWifi -and ($d.error -or $script:pendingWifi.Probed)){
+        $script:pendingWifi.Latest=$d
+        $outcome=Get-WifiSetupOutcome $d $script:pendingWifi.SSID $false
+        if($outcome.State -ne 'Pending'){Finish-WifiSetup $outcome}
+    }elseif($d.error){Set-WifiMessage ('设备返回：'+$d.error) $true}
+    if($d.error -or -not $d.config){return}
+    $script:lastStatus=$d
+    $link=Get-WifiLink $d
+    $script:deviceIP=if($link.Connected){$link.IP}else{''}
+    $summary=@{version=$d.config.Ver;wifiState=$d.config.wifiState;ip=$link.IP;ssid=$link.SSID;wifiReason=$d.wifiReason}
+    try { [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'HoloStation_last_status.json'),(ConvertTo-Json $summary -Compress), (New-Object System.Text.UTF8Encoding($false))) } catch {}
+    if($link.Connected){
+        $network=if($link.SSID){$link.SSID}else{'Wi-Fi'}
+        $connection.Text='USB 已连接 | '+$network+' | IP：'+$link.IP
+    }else{
+        $detail=Get-WifiFailure $d
+        if(-not $detail){$detail='Wi-Fi 尚未联网'}
+        $connection.Text='USB 已连接 | '+$detail
+    }
     if($d.weather.valid){
         $suffix=if($d.weather.stale){'（缓存）'}else{''}
         $weatherStatus.Text=('{0}：{1} °C，{2}，湿度 {3}%{4}' -f $d.weather.city,$d.weather.temperature,$d.weather.condition,$d.weather.humidity,$suffix)
@@ -92,8 +121,18 @@ $timer.Add_Tick({
             $start=$line.IndexOf('HS_REPLY:')
             if($start -ge 0){try{Apply-Status (ConvertFrom-Json $line.Substring($start+9))}catch{}}
         }
-        if(([DateTime]::Now-$script:lastQuery).TotalSeconds -ge 5){Send-Command @{getStatus=@{}}}
-    }catch{$connection.Text='USB 通信中断，请重新连接';$timer.Stop()}
+        if($script:pendingWifi -and [DateTime]::UtcNow -ge $script:pendingWifi.Deadline){
+            Finish-WifiSetup (Get-WifiSetupOutcome $script:pendingWifi.Latest $script:pendingWifi.SSID $true)
+        }
+        $poll=if($script:pendingWifi){1}else{5}
+        if(([DateTime]::Now-$script:lastQuery).TotalSeconds -ge $poll){
+            Send-Command @{getStatus=@{}}
+            if($script:pendingWifi){$script:pendingWifi.Probed=$true}
+        }
+    }catch{
+        $connection.Text='USB 通信中断，请重新连接';$timer.Stop()
+        if($script:pendingWifi){Finish-WifiSetup @{State='Failed';Detail='USB 通信中断，未能确认联网。'}}
+    }
 })
 $scan.Add_Click({
     $ports.Items.Clear()
@@ -101,19 +140,40 @@ $scan.Add_Click({
     if($ports.Items.Contains('COM6')){$ports.SelectedItem='COM6'}elseif($ports.Items.Count){$ports.SelectedIndex=0}
 })
 $connect.Add_Click({Do-Action {
-    if($script:port -and $script:port.IsOpen){$timer.Stop();$script:port.Close();$script:port.Dispose();$script:port=$null;$connect.Text='连接设备';$connection.Text='已断开 USB';return}
+    if($script:port -and $script:port.IsOpen){
+        $timer.Stop();$script:port.Close();$script:port.Dispose();$script:port=$null
+        $script:deviceIP='';$script:lastStatus=$null
+        if($script:pendingWifi){Finish-WifiSetup @{State='Failed';Detail='USB 已断开，未能确认联网。'}}
+        $connect.Text='连接设备';$connection.Text='已断开 USB';return
+    }
     if(-not $ports.SelectedItem){throw '没有检测到串口，请检查 USB 数据线。'}
     $script:port=New-Object System.IO.Ports.SerialPort([string]$ports.SelectedItem,115200,[System.IO.Ports.Parity]::None,8,[System.IO.Ports.StopBits]::One)
     $script:port.Encoding=New-Object System.Text.UTF8Encoding($false)
     $script:port.NewLine="`n";$script:port.DtrEnable=$false;$script:port.RtsEnable=$false
-    $script:port.ReadTimeout=500;$script:port.WriteTimeout=1500;$script:port.Open()
+    $script:port.ReadTimeout=500;$script:port.WriteTimeout=1500
+    try{$script:port.Open()}catch [System.UnauthorizedAccessException]{
+        $script:port.Dispose();$script:port=$null
+        throw '串口被占用。请先在其他配网工具或串口助手中断开连接。'
+    }
     $script:buffer='';$connect.Text='断开设备';$connection.Text='USB 已连接，正在读取状态'
     $timer.Start();Send-Command @{getStatus=@{}}
 }})
 $save.Add_Click({Do-Action {
-    if(-not $ssid.Text){throw '请填写 Wi-Fi 名称。'}
+    if(-not $script:port -or -not $script:port.IsOpen){throw '请先连接设备串口。'}
+    if($script:lastStatus.appHeld){throw '设备应用已停止，请先恢复运行。'}
+    $nameBytes=[Text.Encoding]::UTF8.GetByteCount($ssid.Text)
+    $passwordBytes=[Text.Encoding]::UTF8.GetByteCount($password.Text)
+    if($nameBytes -lt 1 -or $nameBytes -gt 32){throw 'Wi-Fi 名称须为 1–32 个 UTF-8 字节。'}
+    if($passwordBytes -gt 63 -or ($passwordBytes -gt 0 -and $passwordBytes -lt 8)){
+        throw '加密 Wi-Fi 的密码须为 8–63 个 UTF-8 字节。'
+    }
+    $script:port.DiscardInBuffer()
+    $script:buffer=''
+    $script:lastStatus=$null
     Send-Command @{setWiFi=@{ssid=$ssid.Text;psw=$password.Text}}
-    $password.Clear();$message.ForeColor=[System.Drawing.Color]::DarkGreen;$message.Text='已发送到设备。正在联网，请等待状态更新。'
+    $script:pendingWifi=@{SSID=$ssid.Text;Deadline=[DateTime]::UtcNow.AddSeconds(30);Probed=$false;Latest=$null}
+    $save.Enabled=$false;$ssid.Enabled=$false;$password.Enabled=$false
+    Set-WifiMessage ('正在连接 '+$ssid.Text+'，等待路由器分配 IP…') $false
 }})
 $auto.Add_Click({Do-Action {Send-Command @{setPage=@{value=0}}}})
 $charge.Add_Click({Do-Action {Send-Command @{setPage=@{value=1}}}})
